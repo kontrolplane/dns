@@ -139,6 +139,7 @@ type model struct {
 func newModel(domain, server string) model {
 	ti := textinput.New()
 	ti.Placeholder = "example.com"
+	ti.Prompt = ""
 	ti.Focus()
 	ti.CharLimit = 253
 	ti.Width = 40
@@ -423,7 +424,7 @@ func (m model) View() string {
 // space otherwise.
 func focusCursor(on bool) string {
 	if on {
-		return branchStyle.Render("› ")
+		return branchStyle.Render("• ")
 	}
 	return "  "
 }
