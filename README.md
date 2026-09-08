@@ -1,5 +1,5 @@
 <p align="center">
-  <h1 align="center">dns</h1>
+  <h1>dns</h1>
 </p>
 
 `dns` is a terminal user interface (tui) application that takes a domain name and queries out everything it can find - DNS records across all common types plus live subdomain enumeration — into a single navigable view. Results stream in live as queries complete, making it a fast way to investigate the surface area of any domain directly from the terminal.
