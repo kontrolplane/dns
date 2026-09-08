@@ -34,25 +34,18 @@ func wordlist() []string {
 // progress denominator before discovered names are merged in.
 func WordlistSize() int { return len(wordlist()) }
 
-// Progress reports enumeration advancement. Total is the full candidate
-// count, which grows as AXFR- and certificate-derived names are admitted, so
-// it accompanies every tick.
-type Progress struct {
-	Total int
-}
-
 // EnumerateSubdomains probes candidate subdomains against the domain using a
 // bounded, self-feeding worker pool. Each resolving host is emitted on found
 // (with its TLS certificate if one was presented) and every candidate tried
 // emits a Progress tick. Candidates come from three sources: the embedded
 // wordlist, a zone-transfer (AXFR) attempt, and — the in-app form of
 // certificate-transparency discovery — the Subject Alternative Names read off
-// each live host's own certificate, fed back in as new candidates. The Total
+// each live host's own certificate, fed back in as new candidates. The total
 // reported on each tick grows as those names are admitted. Certificate
 // harvesting (and the SAN feedback it drives) happens only when certs is true.
-func (r *Resolver) EnumerateSubdomains(domain string, certs bool) (found <-chan Subdomain, progress <-chan Progress) {
+func (r *Resolver) EnumerateSubdomains(domain string, certs bool) (found <-chan Subdomain, progress <-chan int) {
 	foundCh := make(chan Subdomain)
-	progCh := make(chan Progress)
+	progCh := make(chan int)
 
 	go func() {
 		defer close(foundCh)
@@ -104,7 +97,7 @@ func (r *Resolver) EnumerateSubdomains(domain string, certs bool) (found <-chan 
 						}
 						foundCh <- sub
 					}
-					progCh <- Progress{Total: curTotal()}
+					progCh <- curTotal()
 					wg.Done()
 				}
 			}()

@@ -21,6 +21,9 @@ const (
 	stateScanning
 )
 
+// certIcon marks a host whose TLS certificate was harvested.
+const certIcon = "[c]"
+
 // --- styles ---
 
 // Outer padding around the whole view: top and sides, but not the bottom.
@@ -56,9 +59,6 @@ var (
 	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#9A917A"))
 	errStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#F58A8A"))
 	hostStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#8FB4E8"))
-
-	// certIcon marks a host whose TLS certificate was harvested.
-	certIcon = "[c]"
 
 	// Reachability status dot colors: 2xx green, 3xx orange, 4xx/5xx red.
 	dotGreen  = lipgloss.NewStyle().Foreground(lipgloss.Color("#8EE39E"))
@@ -114,7 +114,7 @@ type model struct {
 
 	recordCh <-chan scan.RecordSet
 	foundCh  <-chan scan.Subdomain
-	progCh   <-chan scan.Progress
+	progCh   <-chan int
 
 	recordsDone bool
 	subsDone    bool
@@ -134,11 +134,12 @@ type model struct {
 	height int
 }
 
-// New builds the initial model, optionally pre-seeded with a domain to
+// newModel builds the initial model, optionally pre-seeded with a domain to
 // scan immediately. server overrides the upstream nameserver when non-empty.
-func New(domain, server string) model {
+func newModel(domain, server string) model {
 	ti := textinput.New()
 	ti.Placeholder = "example.com"
+	ti.Prompt = ""
 	ti.Focus()
 	ti.CharLimit = 253
 	ti.Width = 40
@@ -423,7 +424,7 @@ func (m model) View() string {
 // space otherwise.
 func focusCursor(on bool) string {
 	if on {
-		return branchStyle.Render("› ")
+		return branchStyle.Render("• ")
 	}
 	return "  "
 }
@@ -711,10 +712,10 @@ func waitFound(ch <-chan scan.Subdomain, gen int) tea.Cmd {
 	}
 }
 
-func waitProg(ch <-chan scan.Progress, gen int) tea.Cmd {
+func waitProg(ch <-chan int, gen int) tea.Cmd {
 	return func() tea.Msg {
-		p, ok := <-ch
-		return progressMsg{total: p.Total, ok: ok, gen: gen}
+		total, ok := <-ch
+		return progressMsg{total: total, ok: ok, gen: gen}
 	}
 }
 
@@ -732,7 +733,7 @@ func drain[T any](ch <-chan T) tea.Cmd {
 // Run starts the Bubble Tea program. server overrides the upstream
 // nameserver when non-empty.
 func Run(domain, server string) error {
-	p := tea.NewProgram(New(domain, server), tea.WithAltScreen())
+	p := tea.NewProgram(newModel(domain, server), tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }
