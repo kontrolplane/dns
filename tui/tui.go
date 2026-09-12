@@ -109,7 +109,7 @@ type model struct {
 	focus int
 
 	domain  string
-	records []scan.RecordSet
+	records map[string]scan.RecordSet // keyed by type; RecordTypes gives the order
 	subs    []scan.Subdomain
 
 	recordCh <-chan scan.RecordSet
@@ -174,7 +174,7 @@ func (m model) startScan() (model, tea.Cmd) {
 	}
 	m.gen++
 	m.state = stateScanning
-	m.records = nil
+	m.records = map[string]scan.RecordSet{}
 	m.subs = nil
 	m.recordsDone = false
 	m.subsDone = false
@@ -296,7 +296,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break // stale result from a superseded scan
 		}
 		if msg.ok {
-			m.records = append(m.records, msg.rs)
+			m.records[msg.rs.Type] = msg.rs
 			m.refreshViewport()
 			cmds = append(cmds, waitRecord(m.recordCh, m.gen))
 		} else {
@@ -500,25 +500,39 @@ func (m model) renderResults() string {
 	}
 	root := &treeNode{text: apex}
 
-	// DNS records: one node per type, with answers nested beneath.
+	// DNS records: one node per type that answered, in the canonical order.
+	// Types with nothing to show are collapsed onto a single trailing line —
+	// most of the two dozen types queried are absent on any given domain, and
+	// a screen of "—" buries the ones that are not.
 	records := &treeNode{text: branchStyle.Render("records")}
-	if len(m.records) == 0 {
-		records.children = append(records.children, &treeNode{text: dimStyle.Render("querying...")})
-	}
-	for _, rs := range m.records {
-		node := &treeNode{}
+	var empty []string
+	for _, name := range scan.RecordTypes() {
+		rs, arrived := m.records[name]
 		switch {
+		case !arrived:
+			empty = append(empty, dimStyle.Render(name))
 		case rs.Err != nil:
-			node.text = labelStyle.Render(rs.Type) + "  " + errStyle.Render(rs.Err.Error())
+			records.children = append(records.children, &treeNode{
+				text: labelStyle.Render(name) + "  " + errStyle.Render(rs.Err.Error()),
+			})
 		case len(rs.Records) == 0:
-			node.text = dimStyle.Render(rs.Type + "  —")
+			empty = append(empty, dimStyle.Render(name))
 		default:
-			node.text = labelStyle.Render(rs.Type)
+			node := &treeNode{text: labelStyle.Render(name)}
 			for _, rec := range rs.Records {
 				node.children = append(node.children, &treeNode{text: valueStyle.Render(rec)})
 			}
+			records.children = append(records.children, node)
 		}
-		records.children = append(records.children, node)
+	}
+	if len(empty) > 0 {
+		label := "no answer"
+		if !m.recordsDone {
+			label = "pending"
+		}
+		records.children = append(records.children, &treeNode{
+			text: dimStyle.Render(label+"  ") + strings.Join(empty, dimStyle.Render(" · ")),
+		})
 	}
 
 	// Subdomains: nested by label depth below the apex.

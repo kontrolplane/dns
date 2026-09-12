@@ -51,8 +51,14 @@ func (m model) save() (string, error) {
 		ApexCert:   m.apexCert,
 	}
 
-	for _, rs := range m.records {
-		re := recordExport{Type: rs.Type, Records: rs.Records}
+	// Records arrive concurrently; emit them in the canonical order so two
+	// exports of the same zone diff cleanly.
+	for _, name := range scan.RecordTypes() {
+		rs, ok := m.records[name]
+		if !ok {
+			continue
+		}
+		re := recordExport{Type: name, Records: rs.Records}
 		if rs.Err != nil {
 			re.Error = rs.Err.Error()
 		}

@@ -7,6 +7,18 @@ import (
 
 // These run without a network so they execute under -short in CI.
 
+func TestRecordTypesMatchTable(t *testing.T) {
+	names := RecordTypes()
+	if len(names) != len(recordTypes) {
+		t.Fatalf("RecordTypes returned %d names for %d types", len(names), len(recordTypes))
+	}
+	for i, rt := range recordTypes {
+		if names[i] != rt.name {
+			t.Errorf("position %d: RecordTypes gave %q, table has %q", i, names[i], rt.name)
+		}
+	}
+}
+
 // The pool must bound live goroutines rather than the work list, which is what
 // keeps a large zone transfer from costing a goroutine per name.
 func TestPoolBoundsConcurrency(t *testing.T) {
