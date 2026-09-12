@@ -30,17 +30,36 @@ The flag takes a bare address or an explicit port (`8.8.8.8` or `8.8.8.8:53`).
 
 ## what it shows
 
-- records: A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, CAA and PTR for the apex domain.
-- subdomains: resolves candidate hostnames concurrently and lists those that answer, with their addresses and any CNAME chain. Candidates come from three sources: an embedded wordlist of 500 common hostnames, a zone transfer (`AXFR`) attempt against each authoritative nameserver - nearly always refused, but it yields the entire zone on a misconfigured one, the Subject Alternative Names read off each live host's TLS certificate, fed back in as new candidates. This is certificate-transparency discovery done in-app, without querying a CT log.
+- records: 22 record types for the apex domain. Types that answered are listed with their records; the rest collapse onto a single line, since most domains publish only a handful.
+
+  A, AAAA, CNAME, MX, NS, TXT, SOA, CAA · HTTPS, SVCB · DNSKEY, DS, CDS, CDNSKEY, NSEC, NSEC3PARAM · NAPTR, DNAME, SSHFP, RP, LOC, HINFO
+
+- services: fixed labels no hostname wordlist reaches, because they name services rather than hosts - `_dmarc`, `_mta-sts` and `_smtp._tls` for mail policy, `._domainkey` selectors for DKIM, `_acme-challenge` for certificate issuance, and the `SRV` names behind autodiscover, LDAP, Kerberos, CalDAV, XMPP and SIP.
+
+  These tend to name the third parties behind a domain: a DKIM selector pointing at a mail tenant, an ACME challenge delegated somewhere else entirely.
+
+- subdomains: resolves candidates concurrently and lists those that answer, with their addresses and any CNAME chain. Candidates come from three sources:
+
+  - an embedded wordlist of 500 common hostnames
+  - a zone transfer (`AXFR`) against each authoritative nameserver - nearly always refused, but it yields the entire zone on a misconfigured one
+  - the Subject Alternative Names read off each live host's TLS certificate, fed back in as new candidates
+
+  That last one is certificate-transparency discovery done in-app, without ever querying a CT log.
 
 Two optional passes are toggled on the input screen:
 
-- reachability check: probes each discovered host over HTTPS then HTTP and annotates it with the scheme and status code. Redirects are not followed, so the first response is the signal.
+- reachability check: probes each discovered host over HTTPS and HTTP and annotates it with the scheme and status code. Redirects are not followed, so the first response is the signal.
 - certificate harvest: reads the leaf TLS certificate from each live host and shows its issuer, expiry and SANs. This is also what drives SAN-based subdomain discovery above.
 
 Both accept invalid certificates on purpose: the question is whether a host answers, not whether its certificate validates.
 
 Press `s` at any point during a scan to write the results so far to `dns-<domain>-<timestamp>.json` in the working directory.
+
+## how it queries
+
+- Answers arrive whole. Queries advertise an EDNS0 buffer and re-ask over TCP when one is still too large. Without that, a domain's entire TXT set - SPF, DKIM, every ownership token - comes back empty rather than truncated.
+- Absent names are profiled first. A few random labels are resolved to learn how the zone answers names that cannot exist. A zone with a `*` record would otherwise report every candidate as found; and where absent names are denied properly, a name that answers with no address at all still counts as discovered, which is how mail-only hosts turn up.
+- Queries are capped at 32 in flight across every pass. Wider is not faster - a typical home or ISP resolver starts dropping datagrams past roughly that point, and the timeouts cost more than the extra parallelism buys.
 
 ## keybindings
 
