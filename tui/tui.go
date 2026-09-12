@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -23,6 +24,12 @@ const (
 
 // certIcon marks a host whose TLS certificate was harvested.
 const certIcon = "[c]"
+
+// renderInterval is how often the results tree is rebuilt while a scan runs.
+// Results arrive one candidate at a time and rebuilding on each of them costs
+// more than the scan itself on a large zone, so repaints are coalesced onto a
+// timer instead. The tree is rebuilt only when something actually changed.
+const renderInterval = 80 * time.Millisecond
 
 // --- styles ---
 
@@ -102,6 +109,9 @@ type serviceResultMsg struct {
 	gen int
 }
 
+// renderTickMsg drives the coalesced repaint described on renderInterval.
+type renderTickMsg struct{ gen int }
+
 // --- model ---
 
 type model struct {
@@ -135,6 +145,10 @@ type model struct {
 	servicesDone bool
 	progDone     int
 	progTotal    int
+
+	// dirty marks results as changed since the last repaint; the render tick
+	// clears it. See renderInterval.
+	dirty bool
 
 	reachEnabled bool                  // probe found subdomains over HTTP(S)
 	reach        map[string]scan.Reach // results keyed by host
@@ -200,6 +214,7 @@ func (m model) startScan() (model, tea.Cmd) {
 	m.reach = map[string]scan.Reach{}
 	m.reachPending = 0
 	m.certs = map[string]*scan.CertInfo{}
+	m.dirty = true
 	m.saveMsg = ""
 
 	// Drain any channels left over from a superseded scan so its worker
@@ -227,6 +242,7 @@ func (m model) startScan() (model, tea.Cmd) {
 
 	cmds = append(cmds,
 		m.spinner.Tick,
+		renderTick(m.gen),
 		waitRecord(m.recordCh, m.gen),
 		waitFound(m.foundCh, m.gen),
 		waitCert(m.certCh, m.gen),
@@ -318,16 +334,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner, cmd = m.spinner.Update(msg)
 		cmds = append(cmds, cmd)
 
+	case renderTickMsg:
+		if msg.gen != m.gen || m.state != stateScanning {
+			break // stale ticker from a superseded scan
+		}
+		if m.dirty {
+			m.refreshViewport()
+			m.dirty = false
+		} else if !m.scanning() {
+			break // finished and flushed; stop waking up
+		}
+		cmds = append(cmds, renderTick(m.gen))
+
 	case recordResultMsg:
 		if msg.gen != m.gen {
 			break // stale result from a superseded scan
 		}
 		if msg.ok {
 			m.records[msg.rs.Type] = msg.rs
-			m.refreshViewport()
+			m.dirty = true
 			cmds = append(cmds, waitRecord(m.recordCh, m.gen))
 		} else {
 			m.recordsDone = true
+			m.dirty = true
 		}
 
 	case subFoundMsg:
@@ -340,10 +369,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.reachPending++
 				cmds = append(cmds, probeReach(msg.sub.Name, m.gen))
 			}
-			m.refreshViewport()
+			m.dirty = true
 			cmds = append(cmds, waitFound(m.foundCh, m.gen))
 		} else {
 			m.subsDone = true
+			m.dirty = true
 		}
 
 	case certResultMsg:
@@ -352,10 +382,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.ok {
 			m.certs[msg.cert.Host] = msg.cert.Info
-			m.refreshViewport()
+			m.dirty = true
 			cmds = append(cmds, waitCert(m.certCh, m.gen))
 		} else {
 			m.certsDone = true
+			m.dirty = true
 		}
 
 	case serviceResultMsg:
@@ -364,10 +395,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.ok {
 			m.services = append(m.services, msg.svc)
-			m.refreshViewport()
+			m.dirty = true
 			cmds = append(cmds, waitService(m.svcCh, m.gen))
 		} else {
 			m.servicesDone = true
+			m.dirty = true
 		}
 
 	case reachResultMsg:
@@ -376,7 +408,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.reach[msg.host] = msg.reach
 		m.reachPending--
-		m.refreshViewport()
+		m.dirty = true
 
 	case progressMsg:
 		if msg.gen != m.gen {
@@ -385,7 +417,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.ok {
 			m.progDone++
 			m.progTotal = msg.total
-			m.refreshViewport()
+			m.dirty = true
 			cmds = append(cmds, waitProg(m.progCh, m.gen))
 		}
 	}
@@ -801,6 +833,13 @@ func waitService(ch <-chan scan.ServiceRecord, gen int) tea.Cmd {
 		svc, ok := <-ch
 		return serviceResultMsg{svc: svc, ok: ok, gen: gen}
 	}
+}
+
+// renderTick schedules the next coalesced repaint. See renderInterval.
+func renderTick(gen int) tea.Cmd {
+	return tea.Tick(renderInterval, func(time.Time) tea.Msg {
+		return renderTickMsg{gen: gen}
+	})
 }
 
 func waitProg(ch <-chan int, gen int) tea.Cmd {
