@@ -10,6 +10,21 @@ import (
 	"github.com/miekg/dns"
 )
 
+// Query tuning. The timeout is short because a lost UDP datagram is retried
+// rather than waited out: a retry recovers the answer in a fraction of the
+// time a long timeout costs, and an unanswered query is indistinguishable
+// from a name that does not exist, so dropping one silently loses a record.
+const (
+	queryTimeout  = 2 * time.Second
+	queryAttempts = 2
+	retryBackoff  = 50 * time.Millisecond
+
+	// udpBufSize is the EDNS0 buffer advertised to the server. Without it the
+	// server is held to the 512-byte default and anything larger comes back
+	// truncated and empty — which is most real domains' TXT sets.
+	udpBufSize = 4096
+)
+
 // RecordSet holds the answers for a single DNS record type.
 type RecordSet struct {
 	Type    string
@@ -36,7 +51,8 @@ var recordTypes = []struct {
 
 // Resolver wraps a DNS client and the upstream server to query.
 type Resolver struct {
-	client *dns.Client
+	udp    *dns.Client
+	tcp    *dns.Client
 	server string
 }
 
@@ -57,7 +73,8 @@ func NewResolver(server string) *Resolver {
 		}
 	}
 	return &Resolver{
-		client: &dns.Client{Timeout: 5 * time.Second},
+		udp:    &dns.Client{Timeout: queryTimeout},
+		tcp:    &dns.Client{Net: "tcp", Timeout: queryTimeout},
 		server: server,
 	}
 }
@@ -65,13 +82,60 @@ func NewResolver(server string) *Resolver {
 // Server reports the upstream nameserver in use.
 func (r *Resolver) Server() string { return r.server }
 
-// Query looks up a single record type and returns formatted answers.
-func (r *Resolver) Query(domain string, qtype uint16) ([]string, error) {
+// question builds a recursive query for domain, advertising an EDNS0 buffer
+// so large answers arrive whole.
+func question(domain string, qtype uint16) *dns.Msg {
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(domain), qtype)
 	m.RecursionDesired = true
+	m.SetEdns0(udpBufSize, false)
+	return m
+}
 
-	resp, _, err := r.client.Exchange(m, r.server)
+// exchange sends m upstream, retrying a lost datagram or a transient server
+// failure, and re-asking over TCP when the answer is too large for UDP.
+func (r *Resolver) exchange(m *dns.Msg) (*dns.Msg, error) {
+	var err error
+	for attempt := 0; attempt < queryAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(retryBackoff)
+		}
+
+		var resp *dns.Msg
+		resp, _, err = r.udp.Exchange(m, r.server)
+		if err != nil {
+			continue // timeout or lost datagram — worth asking again
+		}
+
+		switch resp.Rcode {
+		case dns.RcodeFormatError, dns.RcodeNotImplemented:
+			// A server too old to understand EDNS0. Drop the OPT record and
+			// accept the 512-byte limit rather than returning nothing.
+			plain := m.Copy()
+			plain.Extra = nil
+			if bare, _, bareErr := r.udp.Exchange(plain, r.server); bareErr == nil {
+				resp = bare
+			}
+		case dns.RcodeServerFailure, dns.RcodeRefused:
+			err = fmt.Errorf("server returned %s", dns.RcodeToString[resp.Rcode])
+			continue
+		}
+
+		if resp.Truncated {
+			// The answer did not fit the advertised buffer. TCP has no such
+			// limit; a failure here leaves the truncated answer in place.
+			if full, _, tcpErr := r.tcp.Exchange(m, r.server); tcpErr == nil {
+				resp = full
+			}
+		}
+		return resp, nil
+	}
+	return nil, err
+}
+
+// Query looks up a single record type and returns formatted answers.
+func (r *Resolver) Query(domain string, qtype uint16) ([]string, error) {
+	resp, err := r.exchange(question(domain, qtype))
 	if err != nil {
 		return nil, err
 	}

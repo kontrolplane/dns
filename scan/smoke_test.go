@@ -1,6 +1,10 @@
 package scan
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/miekg/dns"
+)
 
 // TestResolverSmoke exercises live DNS queries; skipped under -short.
 func TestResolverSmoke(t *testing.T) {
@@ -44,5 +48,25 @@ func TestSubdomainSmoke(t *testing.T) {
 	<-done
 	if len(subs) == 0 {
 		t.Error("expected to discover subdomains for github.com, found none")
+	}
+}
+
+// TestTruncatedAnswerSmoke guards the EDNS0 + TCP fallback path: these
+// domains publish TXT sets far larger than the 512-byte UDP default, and
+// without the fallback they come back empty rather than truncated.
+func TestTruncatedAnswerSmoke(t *testing.T) {
+	if testing.Short() {
+		t.Skip("network test")
+	}
+	r := NewResolver("")
+	for _, domain := range []string{"google.com", "microsoft.com"} {
+		recs, err := r.Query(domain, dns.TypeTXT)
+		if err != nil {
+			t.Errorf("%s TXT: %v", domain, err)
+			continue
+		}
+		if len(recs) < 5 {
+			t.Errorf("%s TXT: got %d records, expected a large set (truncation not handled?)", domain, len(recs))
+		}
 	}
 }
