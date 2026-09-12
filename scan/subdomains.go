@@ -11,12 +11,28 @@ import (
 //go:embed wordlist.txt
 var wordlistRaw string
 
-// Subdomain is a discovered hostname, the addresses it resolves to, and its
-// leaf TLS certificate if one could be fetched.
+// Pool sizes for the two passes. They are separate so that a TLS handshake,
+// which can take seconds, never occupies capacity the resolver needs. The DNS
+// side is only a work queue — the real limit on queries in flight is
+// maxInflight, enforced by the resolver itself, so that concurrent passes
+// cannot add up to more than it.
+const (
+	dnsWorkers  = maxInflight
+	certWorkers = 32
+)
+
+// Subdomain is a discovered hostname and the addresses it resolves to.
+// Certificates arrive separately, on their own channel, because they are
+// fetched after the name is already known and worth showing.
 type Subdomain struct {
 	Name string
 	IPs  []string
-	Cert *CertInfo
+}
+
+// CertResult is a leaf TLS certificate harvested from a discovered host.
+type CertResult struct {
+	Host string
+	Info *CertInfo
 }
 
 // wordlist returns the embedded subdomain candidates.
@@ -34,108 +50,144 @@ func wordlist() []string {
 // progress denominator before discovered names are merged in.
 func WordlistSize() int { return len(wordlist()) }
 
-// EnumerateSubdomains probes candidate subdomains against the domain using a
-// bounded, self-feeding worker pool. Each resolving host is emitted on found
-// (with its TLS certificate if one was presented) and every candidate tried
-// emits a Progress tick. Candidates come from three sources: the embedded
-// wordlist, a zone-transfer (AXFR) attempt, and — the in-app form of
-// certificate-transparency discovery — the Subject Alternative Names read off
-// each live host's own certificate, fed back in as new candidates. The total
-// reported on each tick grows as those names are admitted. Certificate
-// harvesting (and the SAN feedback it drives) happens only when certs is true.
-func (r *Resolver) EnumerateSubdomains(domain string, certs bool) (found <-chan Subdomain, progress <-chan int) {
+// EnumerateSubdomains probes candidate subdomains against the domain and
+// emits each one that exists on found, its certificate on certs, and a
+// Progress tick per candidate tried.
+//
+// Candidates come from three sources: the embedded wordlist, a zone-transfer
+// (AXFR) attempt, and — the in-app form of certificate-transparency discovery
+// — the Subject Alternative Names read off each live host's own certificate.
+// Because that last source feeds new candidates back in, work runs in rounds:
+// every candidate in a round is resolved, then the certificates of whatever
+// turned up are read, and any novel SANs become the next round. Rounds after
+// the first are small, and the structure keeps the queue an ordinary slice
+// however large a zone transfer turns out to be.
+//
+// Certificate harvesting (and the SAN feedback it drives) happens only when
+// harvest is true.
+func (r *Resolver) EnumerateSubdomains(domain string, harvest bool) (found <-chan Subdomain, certs <-chan CertResult, progress <-chan int) {
 	foundCh := make(chan Subdomain)
+	certCh := make(chan CertResult)
 	progCh := make(chan int)
 
 	go func() {
 		defer close(foundCh)
+		defer close(certCh)
 		defer close(progCh)
 
-		// mu guards seen (dedup across all sources) and total (the progress
-		// denominator).
-		var mu sync.Mutex
-		seen := map[string]bool{}
-		total := 0
-		curTotal := func() int { mu.Lock(); defer mu.Unlock(); return total }
+		// Learn how the zone answers names that do not exist before trusting
+		// any answer about names that might.
+		wc := r.profileWildcard(domain)
 
-		const workers = 50
-		jobs := make(chan string)
-		var wg sync.WaitGroup // counts queued-but-unprocessed candidates
-
-		// submit admits novel candidates and queues them. Safe to call from a
-		// worker (the send runs in its own goroutine so it never blocks the
-		// pool). wg tracks each item from submit to processed, so the seeding
-		// sentinel below keeps the pool alive until all sources have fed in.
-		submit := func(words []string) {
-			mu.Lock()
-			var novel []string
+		seen := map[string]bool{"": true}
+		var queued []string
+		admit := func(words []string) {
 			for _, w := range words {
-				if w != "" && !seen[w] {
+				if !seen[w] {
 					seen[w] = true
-					novel = append(novel, w)
+					queued = append(queued, w)
 				}
-			}
-			total += len(novel)
-			mu.Unlock()
-			for _, w := range novel {
-				wg.Add(1)
-				go func(w string) { jobs <- w }(w)
 			}
 		}
 
-		for i := 0; i < workers; i++ {
-			go func() {
-				for word := range jobs {
-					host := word + "." + domain
-					if ips := r.resolveHost(host); len(ips) > 0 {
-						sub := Subdomain{Name: host, IPs: ips}
-						if certs {
-							if leaf := r.fetchCert(host); leaf != nil {
-								sub.Cert = certInfo(leaf)
-								submit(certCandidates(leaf.DNSNames, domain)) // feed SANs back
-							}
-						}
-						foundCh <- sub
-					}
-					progCh <- curTotal()
-					wg.Done()
-				}
-			}()
-		}
+		admit(wordlist())
+		admit(r.axfrSubdomains(domain))
 
-		// Seed the pool. The sentinel keeps wg above zero until every seed
-		// source (including the slow AXFR and apex-cert fetches) has been fed,
-		// so wg.Wait can't fire prematurely between sources.
-		wg.Add(1)
-		submit(wordlist())
-		submit(r.axfrSubdomains(domain))
-		// The apex's own certificate is usually the richest SAN source; probe
-		// it directly and emit it so its cert is shown too.
-		if certs {
+		// The apex's own certificate is usually the richest SAN source, so
+		// read it up front rather than waiting for a round to reach it.
+		if harvest {
 			if leaf := r.fetchCert(domain); leaf != nil {
-				foundCh <- Subdomain{Name: domain, IPs: r.resolveHost(domain), Cert: certInfo(leaf)}
-				submit(certCandidates(leaf.DNSNames, domain))
+				certCh <- CertResult{Host: domain, Info: certInfo(leaf)}
+				admit(certCandidates(leaf.DNSNames, domain))
 			}
 		}
-		wg.Done()
 
-		wg.Wait()
-		close(jobs)
+		total := 0
+		for len(queued) > 0 {
+			batch := queued
+			queued = nil
+			total += len(batch)
+
+			var (
+				mu   sync.Mutex
+				live []string
+			)
+
+			resolvers := newPool(dnsWorkers)
+			for _, word := range batch {
+				host := word + "." + domain
+				resolvers.run(func() {
+					if ips, ok := r.lookupHost(host, wc); ok {
+						foundCh <- Subdomain{Name: host, IPs: ips}
+						mu.Lock()
+						live = append(live, host)
+						mu.Unlock()
+					}
+					progCh <- total
+				})
+			}
+			resolvers.wait()
+
+			if !harvest {
+				continue
+			}
+
+			var sans []string
+			handshakes := newPool(certWorkers)
+			for _, host := range live {
+				handshakes.run(func() {
+					leaf := r.fetchCert(host)
+					if leaf == nil {
+						return
+					}
+					certCh <- CertResult{Host: host, Info: certInfo(leaf)}
+					mu.Lock()
+					sans = append(sans, certCandidates(leaf.DNSNames, domain)...)
+					mu.Unlock()
+				})
+			}
+			handshakes.wait()
+			admit(sans)
+		}
 	}()
 
-	return foundCh, progCh
+	return foundCh, certCh, progCh
 }
 
-// resolveHost returns the A/AAAA addresses (and any CNAME targets in the
-// chain) for a host, deduplicated, or nil if it does not resolve.
-func (r *Resolver) resolveHost(host string) []string {
+// lookupHost resolves a candidate and reports whether it exists. A and AAAA
+// are asked concurrently, so a candidate costs one round trip rather than two.
+//
+// Existence is more than "returned an address". An answer the zone synthesises
+// for everything is rejected, and a name that answers NOERROR with nothing in
+// it still exists — mail-only hosts and empty non-terminals look like this —
+// but only on a zone that denies absent names with NXDOMAIN in the first place.
+func (r *Resolver) lookupHost(host string, wc wildcard) ([]string, bool) {
+	var (
+		qtypes = [...]uint16{dns.TypeA, dns.TypeAAAA}
+		answer [len(qtypes)][]string
+		noerr  [len(qtypes)]bool
+		wg     sync.WaitGroup
+	)
+
+	for i, qt := range qtypes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := r.exchange(question(host, qt))
+			if err != nil {
+				return
+			}
+			noerr[i] = resp.Rcode == dns.RcodeSuccess
+			for _, rr := range resp.Answer {
+				answer[i] = append(answer[i], formatRR(rr))
+			}
+		}()
+	}
+	wg.Wait()
+
 	seen := map[string]bool{}
 	var ips []string
-	for _, qt := range []uint16{dns.TypeA, dns.TypeAAAA} {
-		recs, err := r.Query(host, qt)
-		if err != nil {
-			continue
-		}
+	for _, recs := range answer {
 		for _, rec := range recs {
 			if !seen[rec] {
 				seen[rec] = true
@@ -143,5 +195,12 @@ func (r *Resolver) resolveHost(host string) []string {
 			}
 		}
 	}
-	return ips
+
+	if len(ips) > 0 {
+		if wc.synthesised(ips) {
+			return nil, false
+		}
+		return ips, true
+	}
+	return nil, wc.nxdomain && (noerr[0] || noerr[1])
 }

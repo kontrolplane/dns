@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -23,6 +24,12 @@ const (
 
 // certIcon marks a host whose TLS certificate was harvested.
 const certIcon = "[c]"
+
+// renderInterval is how often the results tree is rebuilt while a scan runs.
+// Results arrive one candidate at a time and rebuilding on each of them costs
+// more than the scan itself on a large zone, so repaints are coalesced onto a
+// timer instead. The tree is rebuilt only when something actually changed.
+const renderInterval = 80 * time.Millisecond
 
 // --- styles ---
 
@@ -91,6 +98,19 @@ type reachResultMsg struct {
 	reach scan.Reach
 	gen   int
 }
+type certResultMsg struct {
+	cert scan.CertResult
+	ok   bool
+	gen  int
+}
+type serviceResultMsg struct {
+	svc scan.ServiceRecord
+	ok  bool
+	gen int
+}
+
+// renderTickMsg drives the coalesced repaint described on renderInterval.
+type renderTickMsg struct{ gen int }
 
 // --- model ---
 
@@ -108,25 +128,34 @@ type model struct {
 	// 1 the reachability checkbox, 2 the certificate checkbox.
 	focus int
 
-	domain  string
-	records []scan.RecordSet
-	subs    []scan.Subdomain
+	domain   string
+	records  map[string]scan.RecordSet // keyed by type; RecordTypes gives the order
+	subs     []scan.Subdomain
+	services []scan.ServiceRecord
 
 	recordCh <-chan scan.RecordSet
 	foundCh  <-chan scan.Subdomain
+	certCh   <-chan scan.CertResult
+	svcCh    <-chan scan.ServiceRecord
 	progCh   <-chan int
 
-	recordsDone bool
-	subsDone    bool
-	progDone    int
-	progTotal   int
+	recordsDone  bool
+	subsDone     bool
+	certsDone    bool
+	servicesDone bool
+	progDone     int
+	progTotal    int
+
+	// dirty marks results as changed since the last repaint; the render tick
+	// clears it. See renderInterval.
+	dirty bool
 
 	reachEnabled bool                  // probe found subdomains over HTTP(S)
 	reach        map[string]scan.Reach // results keyed by host
 	reachPending int                   // probes still in flight
 
-	certEnabled bool           // harvest TLS certs and mine SANs (default on)
-	apexCert    *scan.CertInfo // the apex domain's own TLS certificate
+	certEnabled bool                      // harvest TLS certs and mine SANs (default on)
+	certs       map[string]*scan.CertInfo // harvested certificates keyed by host
 
 	saveMsg string // footer feedback after an export (path saved or error)
 
@@ -174,14 +203,18 @@ func (m model) startScan() (model, tea.Cmd) {
 	}
 	m.gen++
 	m.state = stateScanning
-	m.records = nil
+	m.records = map[string]scan.RecordSet{}
 	m.subs = nil
+	m.services = nil
 	m.recordsDone = false
 	m.subsDone = false
+	m.certsDone = false
+	m.servicesDone = false
 	m.progDone = 0
 	m.reach = map[string]scan.Reach{}
 	m.reachPending = 0
-	m.apexCert = nil
+	m.certs = map[string]*scan.CertInfo{}
+	m.dirty = true
 	m.saveMsg = ""
 
 	// Drain any channels left over from a superseded scan so its worker
@@ -193,17 +226,27 @@ func (m model) startScan() (model, tea.Cmd) {
 	if m.foundCh != nil {
 		cmds = append(cmds, drain(m.foundCh))
 	}
+	if m.certCh != nil {
+		cmds = append(cmds, drain(m.certCh))
+	}
+	if m.svcCh != nil {
+		cmds = append(cmds, drain(m.svcCh))
+	}
 	if m.progCh != nil {
 		cmds = append(cmds, drain(m.progCh))
 	}
 
 	m.recordCh = m.resolver.AllRecords(m.domain)
-	m.foundCh, m.progCh = m.resolver.EnumerateSubdomains(m.domain, m.certEnabled)
+	m.svcCh = m.resolver.ProbeServices(m.domain)
+	m.foundCh, m.certCh, m.progCh = m.resolver.EnumerateSubdomains(m.domain, m.certEnabled)
 
 	cmds = append(cmds,
 		m.spinner.Tick,
+		renderTick(m.gen),
 		waitRecord(m.recordCh, m.gen),
 		waitFound(m.foundCh, m.gen),
+		waitCert(m.certCh, m.gen),
+		waitService(m.svcCh, m.gen),
 		waitProg(m.progCh, m.gen),
 	)
 	if m.reachEnabled {
@@ -291,16 +334,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner, cmd = m.spinner.Update(msg)
 		cmds = append(cmds, cmd)
 
+	case renderTickMsg:
+		if msg.gen != m.gen || m.state != stateScanning {
+			break // stale ticker from a superseded scan
+		}
+		if m.dirty {
+			m.refreshViewport()
+			m.dirty = false
+		} else if !m.scanning() {
+			break // finished and flushed; stop waking up
+		}
+		cmds = append(cmds, renderTick(m.gen))
+
 	case recordResultMsg:
 		if msg.gen != m.gen {
 			break // stale result from a superseded scan
 		}
 		if msg.ok {
-			m.records = append(m.records, msg.rs)
-			m.refreshViewport()
+			m.records[msg.rs.Type] = msg.rs
+			m.dirty = true
 			cmds = append(cmds, waitRecord(m.recordCh, m.gen))
 		} else {
 			m.recordsDone = true
+			m.dirty = true
 		}
 
 	case subFoundMsg:
@@ -308,21 +364,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break // stale result from a superseded scan
 		}
 		if msg.ok {
-			if msg.sub.Name == m.domain {
-				// The apex emitted for its certificate; reachability for the
-				// apex is already probed in startScan.
-				m.apexCert = msg.sub.Cert
-			} else {
-				m.subs = append(m.subs, msg.sub)
-				if m.reachEnabled {
-					m.reachPending++
-					cmds = append(cmds, probeReach(msg.sub.Name, m.gen))
-				}
+			m.subs = append(m.subs, msg.sub)
+			if m.reachEnabled {
+				m.reachPending++
+				cmds = append(cmds, probeReach(msg.sub.Name, m.gen))
 			}
-			m.refreshViewport()
+			m.dirty = true
 			cmds = append(cmds, waitFound(m.foundCh, m.gen))
 		} else {
 			m.subsDone = true
+			m.dirty = true
+		}
+
+	case certResultMsg:
+		if msg.gen != m.gen {
+			break // stale result from a superseded scan
+		}
+		if msg.ok {
+			m.certs[msg.cert.Host] = msg.cert.Info
+			m.dirty = true
+			cmds = append(cmds, waitCert(m.certCh, m.gen))
+		} else {
+			m.certsDone = true
+			m.dirty = true
+		}
+
+	case serviceResultMsg:
+		if msg.gen != m.gen {
+			break // stale result from a superseded scan
+		}
+		if msg.ok {
+			m.services = append(m.services, msg.svc)
+			m.dirty = true
+			cmds = append(cmds, waitService(m.svcCh, m.gen))
+		} else {
+			m.servicesDone = true
+			m.dirty = true
 		}
 
 	case reachResultMsg:
@@ -331,7 +408,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.reach[msg.host] = msg.reach
 		m.reachPending--
-		m.refreshViewport()
+		m.dirty = true
 
 	case progressMsg:
 		if msg.gen != m.gen {
@@ -340,7 +417,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.ok {
 			m.progDone++
 			m.progTotal = msg.total
-			m.refreshViewport()
+			m.dirty = true
 			cmds = append(cmds, waitProg(m.progCh, m.gen))
 		}
 	}
@@ -379,7 +456,7 @@ func (m *model) refreshViewport() {
 }
 
 func (m model) scanning() bool {
-	return !m.recordsDone || !m.subsDone || m.reachPending > 0
+	return !m.recordsDone || !m.subsDone || !m.certsDone || !m.servicesDone || m.reachPending > 0
 }
 
 // reachTotal is the number of hosts probed for reachability: every found
@@ -387,18 +464,7 @@ func (m model) scanning() bool {
 func (m model) reachTotal() int { return len(m.subs) + 1 }
 
 // certCount reports how many harvested certificates we hold (apex + subs).
-func (m model) certCount() int {
-	n := 0
-	if m.apexCert != nil {
-		n++
-	}
-	for _, s := range m.subs {
-		if s.Cert != nil {
-			n++
-		}
-	}
-	return n
-}
+func (m model) certCount() int { return len(m.certs) }
 
 // reachableCount reports how many probed hosts answered an HTTP request.
 func (m model) reachableCount() int {
@@ -500,30 +566,62 @@ func (m model) renderResults() string {
 	}
 	root := &treeNode{text: apex}
 
-	// DNS records: one node per type, with answers nested beneath.
+	// DNS records: one node per type that answered, in the canonical order.
+	// Types with nothing to show are collapsed onto a single trailing line —
+	// most of the two dozen types queried are absent on any given domain, and
+	// a screen of "—" buries the ones that are not.
 	records := &treeNode{text: branchStyle.Render("records")}
-	if len(m.records) == 0 {
-		records.children = append(records.children, &treeNode{text: dimStyle.Render("querying...")})
-	}
-	for _, rs := range m.records {
-		node := &treeNode{}
+	var empty []string
+	for _, name := range scan.RecordTypes() {
+		rs, arrived := m.records[name]
 		switch {
+		case !arrived:
+			empty = append(empty, dimStyle.Render(name))
 		case rs.Err != nil:
-			node.text = labelStyle.Render(rs.Type) + "  " + errStyle.Render(rs.Err.Error())
+			records.children = append(records.children, &treeNode{
+				text: labelStyle.Render(name) + "  " + errStyle.Render(rs.Err.Error()),
+			})
 		case len(rs.Records) == 0:
-			node.text = dimStyle.Render(rs.Type + "  —")
+			empty = append(empty, dimStyle.Render(name))
 		default:
-			node.text = labelStyle.Render(rs.Type)
+			node := &treeNode{text: labelStyle.Render(name)}
 			for _, rec := range rs.Records {
 				node.children = append(node.children, &treeNode{text: valueStyle.Render(rec)})
 			}
+			records.children = append(records.children, node)
 		}
-		records.children = append(records.children, node)
+	}
+	if len(empty) > 0 {
+		label := "no answer"
+		if !m.recordsDone {
+			label = "pending"
+		}
+		records.children = append(records.children, &treeNode{
+			text: dimStyle.Render(label+"  ") + strings.Join(empty, dimStyle.Render(" · ")),
+		})
+	}
+
+	// Service names: fixed labels that carry mail, certificate and
+	// autoconfiguration records no hostname wordlist would reach.
+	services := &treeNode{text: branchStyle.Render(fmt.Sprintf("services (%d)", len(m.services)))}
+	for _, svc := range sortedServices(m.services) {
+		node := &treeNode{text: hostStyle.Render(svc.Name) + "  " + labelStyle.Render(svc.Type)}
+		for _, rec := range svc.Records {
+			node.children = append(node.children, &treeNode{text: valueStyle.Render(rec)})
+		}
+		services.children = append(services.children, node)
+	}
+	if len(services.children) == 0 {
+		msg := "probing..."
+		if m.servicesDone {
+			msg = "none found"
+		}
+		services.children = append(services.children, &treeNode{text: dimStyle.Render(msg)})
 	}
 
 	// Subdomains: nested by label depth below the apex.
 	subs := &treeNode{text: branchStyle.Render(fmt.Sprintf("subdomains (%d)", len(m.subs)))}
-	subs.children = buildSubTree(m.domain, m.subs, m.reach, m.reachEnabled)
+	subs.children = buildSubTree(m.domain, m.subs, m.certs, m.reach, m.reachEnabled)
 	if len(subs.children) == 0 {
 		msg := "probing..."
 		if m.subsDone {
@@ -532,9 +630,9 @@ func (m model) renderResults() string {
 		subs.children = append(subs.children, &treeNode{text: dimStyle.Render(msg)})
 	}
 
-	root.children = []*treeNode{records, subs}
-	if m.apexCert != nil {
-		root.children = append([]*treeNode{{text: renderCert(m.apexCert)}}, root.children...)
+	root.children = []*treeNode{records, services, subs}
+	if apex := m.certs[m.domain]; apex != nil {
+		root.children = append([]*treeNode{{text: renderCert(apex)}}, root.children...)
 	}
 
 	var b strings.Builder
@@ -548,7 +646,6 @@ type subNode struct {
 	label    string
 	name     string // full host, set only on nodes that are a discovered subdomain
 	ips      []string
-	cert     *scan.CertInfo
 	children map[string]*subNode
 }
 
@@ -556,7 +653,7 @@ type subNode struct {
 // relative to the apex domain (e.g. api.staging nests api under staging).
 // When reachOn is set, each discovered host is annotated with its HTTP(S)
 // reachability from reach (or a pending marker until its probe returns).
-func buildSubTree(domain string, found []scan.Subdomain, reach map[string]scan.Reach, reachOn bool) []*treeNode {
+func buildSubTree(domain string, found []scan.Subdomain, certs map[string]*scan.CertInfo, reach map[string]scan.Reach, reachOn bool) []*treeNode {
 	root := &subNode{children: map[string]*subNode{}}
 	suffix := "." + domain
 	for _, s := range found {
@@ -574,12 +671,11 @@ func buildSubTree(domain string, found []scan.Subdomain, reach map[string]scan.R
 		}
 		cur.ips = s.IPs
 		cur.name = s.Name
-		cur.cert = s.Cert
 	}
-	return root.toTreeNodes(reach, reachOn)
+	return root.toTreeNodes(certs, reach, reachOn)
 }
 
-func (n *subNode) toTreeNodes(reach map[string]scan.Reach, reachOn bool) []*treeNode {
+func (n *subNode) toTreeNodes(certs map[string]*scan.CertInfo, reach map[string]scan.Reach, reachOn bool) []*treeNode {
 	keys := make([]string, 0, len(n.children))
 	for k := range n.children {
 		keys = append(keys, k)
@@ -590,7 +686,7 @@ func (n *subNode) toTreeNodes(reach map[string]scan.Reach, reachOn bool) []*tree
 	for _, k := range keys {
 		c := n.children[k]
 		text := hostStyle.Render(c.label)
-		if c.cert != nil {
+		if c.name != "" && certs[c.name] != nil {
 			text += " " + labelStyle.Render(certIcon)
 		}
 		if reachOn && c.name != "" {
@@ -602,9 +698,22 @@ func (n *subNode) toTreeNodes(reach map[string]scan.Reach, reachOn bool) []*tree
 		if reachOn && c.name != "" {
 			text += "  " + renderReach(reach, c.name)
 		}
-		node := &treeNode{text: text, children: c.toTreeNodes(reach, reachOn)}
+		node := &treeNode{text: text, children: c.toTreeNodes(certs, reach, reachOn)}
 		out = append(out, node)
 	}
+	return out
+}
+
+// sortedServices orders service results by name then type, so the pane is
+// stable however the concurrent probes happen to return.
+func sortedServices(svcs []scan.ServiceRecord) []scan.ServiceRecord {
+	out := append([]scan.ServiceRecord(nil), svcs...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name != out[j].Name {
+			return out[i].Name < out[j].Name
+		}
+		return out[i].Type < out[j].Type
+	})
 	return out
 }
 
@@ -710,6 +819,27 @@ func waitFound(ch <-chan scan.Subdomain, gen int) tea.Cmd {
 		sub, ok := <-ch
 		return subFoundMsg{sub: sub, ok: ok, gen: gen}
 	}
+}
+
+func waitCert(ch <-chan scan.CertResult, gen int) tea.Cmd {
+	return func() tea.Msg {
+		cert, ok := <-ch
+		return certResultMsg{cert: cert, ok: ok, gen: gen}
+	}
+}
+
+func waitService(ch <-chan scan.ServiceRecord, gen int) tea.Cmd {
+	return func() tea.Msg {
+		svc, ok := <-ch
+		return serviceResultMsg{svc: svc, ok: ok, gen: gen}
+	}
+}
+
+// renderTick schedules the next coalesced repaint. See renderInterval.
+func renderTick(gen int) tea.Cmd {
+	return tea.Tick(renderInterval, func(time.Time) tea.Msg {
+		return renderTickMsg{gen: gen}
+	})
 }
 
 func waitProg(ch <-chan int, gen int) tea.Cmd {
