@@ -2,9 +2,9 @@
   <h1>dns</h1>
 </p>
 
-`dns` is a terminal user interface (tui) application that takes a domain name and queries out everything it can find — DNS records across all common types, plus live subdomain enumeration — into a single navigable view. Results stream in as queries complete, making it a fast way to investigate the surface area of any domain directly from the terminal.
+`dns` is a terminal user interface (tui) application that takes a domain name and queries out everything it can find - dns records across all common types, plus live subdomain enumeration into a single navigable view. Results stream in as queries complete, making it a fast way to investigate the surface area of any domain directly from the terminal.
 
-Everything runs from your machine against the zone's own nameservers and hosts. There are no third-party APIs, no accounts, and no keys.
+Everything runs from your machine against the zone's own nameservers and hosts. There are no third-party apis, no accounts, and no keys.
 
 ## usage
 
@@ -28,40 +28,15 @@ dns -ns 8.8.8.8 example.com
 
 The flag takes a bare address or an explicit port (`8.8.8.8` or `8.8.8.8:53`).
 
-## demonstration
-
-`live scan`
-<p align="center">
-  <img width="2400" alt="dns live scan" src="./assets/cassette.gif">
-</p>
-
-`input screen`
-<p align="center">
-  <img width="2400" alt="dns input screen" src="./assets/pages/scan/input.png">
-</p>
-
-`dns records`
-<p align="center">
-  <img width="2400" alt="dns dns records" src="./assets/pages/scan/records.png">
-</p>
-
-`subdomains`
-<p align="center">
-  <img width="2400" alt="dns subdomains" src="./assets/pages/scan/subdomains.png">
-</p>
-
 ## what it shows
 
-- **DNS records** — A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, CAA and PTR for the apex domain.
-- **Subdomains** — resolves candidate hostnames concurrently and lists those that answer, with their addresses and any CNAME chain. Candidates come from three sources:
-  - an embedded wordlist of 500 common hostnames,
-  - a zone transfer (`AXFR`) attempt against each authoritative nameserver — nearly always refused, but it yields the entire zone on a misconfigured one,
-  - the Subject Alternative Names read off each live host's TLS certificate, fed back in as new candidates. This is certificate-transparency discovery done in-app, without querying a CT log.
+- records: A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, CAA and PTR for the apex domain.
+- subdomains: resolves candidate hostnames concurrently and lists those that answer, with their addresses and any CNAME chain. Candidates come from three sources: an embedded wordlist of 500 common hostnames, a zone transfer (`AXFR`) attempt against each authoritative nameserver - nearly always refused, but it yields the entire zone on a misconfigured one, the Subject Alternative Names read off each live host's TLS certificate, fed back in as new candidates. This is certificate-transparency discovery done in-app, without querying a CT log.
 
 Two optional passes are toggled on the input screen:
 
-- **reachability check** — probes each discovered host over HTTPS then HTTP and annotates it with the scheme and status code. Redirects are not followed, so the first response is the signal.
-- **certificate harvest** — reads the leaf TLS certificate from each live host and shows its issuer, expiry and SANs. This is also what drives SAN-based subdomain discovery above.
+- reachability check: probes each discovered host over HTTPS then HTTP and annotates it with the scheme and status code. Redirects are not followed, so the first response is the signal.
+- certificate harvest: reads the leaf TLS certificate from each live host and shows its issuer, expiry and SANs. This is also what drives SAN-based subdomain discovery above.
 
 Both accept invalid certificates on purpose: the question is whether a host answers, not whether its certificate validates.
 
@@ -69,13 +44,13 @@ Press `s` at any point during a scan to write the results so far to `dns-<domain
 
 ## keybindings
 
-**input screen**
+input screen:
 
 - `tab` / `↓`, `shift+tab` / `↑`: move between the domain field and the toggles
 - `space`: toggle the focused option
 - `enter`: start the scan
 
-**during a scan**
+during a scan:
 
 - `↑`, `↓`: scroll results
 - `s`: save results to a JSON file
