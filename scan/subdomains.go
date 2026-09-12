@@ -75,6 +75,10 @@ func (r *Resolver) EnumerateSubdomains(domain string, harvest bool) (found <-cha
 		defer close(certCh)
 		defer close(progCh)
 
+		// Learn how the zone answers names that do not exist before trusting
+		// any answer about names that might.
+		wc := r.profileWildcard(domain)
+
 		seen := map[string]bool{"": true}
 		var queued []string
 		admit := func(words []string) {
@@ -113,7 +117,7 @@ func (r *Resolver) EnumerateSubdomains(domain string, harvest bool) (found <-cha
 			for _, word := range batch {
 				host := word + "." + domain
 				resolvers.run(func() {
-					if ips, ok := r.lookupHost(host); ok {
+					if ips, ok := r.lookupHost(host, wc); ok {
 						foundCh <- Subdomain{Name: host, IPs: ips}
 						mu.Lock()
 						live = append(live, host)
@@ -150,12 +154,18 @@ func (r *Resolver) EnumerateSubdomains(domain string, harvest bool) (found <-cha
 	return foundCh, certCh, progCh
 }
 
-// lookupHost resolves a candidate and reports whether it answered. A and AAAA
+// lookupHost resolves a candidate and reports whether it exists. A and AAAA
 // are asked concurrently, so a candidate costs one round trip rather than two.
-func (r *Resolver) lookupHost(host string) ([]string, bool) {
+//
+// Existence is more than "returned an address". An answer the zone synthesises
+// for everything is rejected, and a name that answers NOERROR with nothing in
+// it still exists — mail-only hosts and empty non-terminals look like this —
+// but only on a zone that denies absent names with NXDOMAIN in the first place.
+func (r *Resolver) lookupHost(host string, wc wildcard) ([]string, bool) {
 	var (
 		qtypes = [...]uint16{dns.TypeA, dns.TypeAAAA}
 		answer [len(qtypes)][]string
+		noerr  [len(qtypes)]bool
 		wg     sync.WaitGroup
 	)
 
@@ -167,6 +177,7 @@ func (r *Resolver) lookupHost(host string) ([]string, bool) {
 			if err != nil {
 				return
 			}
+			noerr[i] = resp.Rcode == dns.RcodeSuccess
 			for _, rr := range resp.Answer {
 				answer[i] = append(answer[i], formatRR(rr))
 			}
@@ -184,5 +195,12 @@ func (r *Resolver) lookupHost(host string) ([]string, bool) {
 			}
 		}
 	}
-	return ips, len(ips) > 0
+
+	if len(ips) > 0 {
+		if wc.synthesised(ips) {
+			return nil, false
+		}
+		return ips, true
+	}
+	return nil, wc.nxdomain && (noerr[0] || noerr[1])
 }
