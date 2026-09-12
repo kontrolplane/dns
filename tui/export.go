@@ -14,12 +14,19 @@ import (
 // results but flattens record errors to strings (an error value marshals to
 // an empty object) and only includes reachability when it was enabled.
 type snapshot struct {
-	Domain     string         `json:"domain"`
-	Nameserver string         `json:"nameserver"`
-	ScannedAt  string         `json:"scanned_at"`
-	Records    []recordExport `json:"records"`
-	ApexCert   *scan.CertInfo `json:"apex_cert,omitempty"`
-	Subdomains []subExport    `json:"subdomains"`
+	Domain     string          `json:"domain"`
+	Nameserver string          `json:"nameserver"`
+	ScannedAt  string          `json:"scanned_at"`
+	Records    []recordExport  `json:"records"`
+	ApexCert   *scan.CertInfo  `json:"apex_cert,omitempty"`
+	Services   []serviceExport `json:"services,omitempty"`
+	Subdomains []subExport     `json:"subdomains"`
+}
+
+type serviceExport struct {
+	Name    string   `json:"name"`
+	Type    string   `json:"type"`
+	Records []string `json:"records"`
 }
 
 type recordExport struct {
@@ -52,8 +59,8 @@ func (m model) save() (string, error) {
 		ApexCert:   m.certs[m.domain],
 	}
 
-	// Records arrive concurrently; emit them in the canonical order so two
-	// exports of the same zone diff cleanly.
+	// Records and subdomains arrive concurrently; emit both in a stable order
+	// so two exports of the same zone diff cleanly.
 	for _, name := range scan.RecordTypes() {
 		rs, ok := m.records[name]
 		if !ok {
@@ -64,6 +71,12 @@ func (m model) save() (string, error) {
 			re.Error = rs.Err.Error()
 		}
 		snap.Records = append(snap.Records, re)
+	}
+
+	for _, svc := range sortedServices(m.services) {
+		snap.Services = append(snap.Services, serviceExport{
+			Name: svc.Name, Type: svc.Type, Records: svc.Records,
+		})
 	}
 
 	subs := append([]scan.Subdomain(nil), m.subs...)

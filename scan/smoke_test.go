@@ -79,3 +79,21 @@ func TestTruncatedAnswerSmoke(t *testing.T) {
 		}
 	}
 }
+
+// TestServiceProbeSmoke exercises the service-name pass; skipped under -short.
+func TestServiceProbeSmoke(t *testing.T) {
+	if testing.Short() {
+		t.Skip("network test")
+	}
+	r := NewResolver("")
+	var got []ServiceRecord
+	for svc := range r.ProbeServices("google.com") {
+		got = append(got, svc)
+	}
+	if len(got) == 0 {
+		t.Error("expected service records for google.com, found none")
+	}
+	for _, svc := range got {
+		t.Logf("%-24s %-6s %.80v", svc.Name, svc.Type, svc.Records)
+	}
+}
