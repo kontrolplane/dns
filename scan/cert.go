@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+// certDialTimeout bounds the TCP+TLS handshake of a single certificate read.
+// It is shorter than a DNS timeout because a host that has not completed a
+// handshake by now is almost never going to.
+const certDialTimeout = 3 * time.Second
+
 // CertInfo is the digest of a leaf TLS certificate that recon cares about.
 type CertInfo struct {
 	Issuer  string    // issuer common name (or first organization)
@@ -19,7 +24,7 @@ type CertInfo struct {
 // certificate, or nil if the host doesn't speak TLS there. Verification is
 // skipped — we want whatever cert the server presents, valid or not.
 func (r *Resolver) fetchCert(host string) *x509.Certificate {
-	d := &net.Dialer{Timeout: 5 * time.Second}
+	d := &net.Dialer{Timeout: certDialTimeout}
 	conn, err := tls.DialWithDialer(d, "tcp", net.JoinHostPort(host, "443"), &tls.Config{
 		InsecureSkipVerify: true,
 		ServerName:         host,
