@@ -91,6 +91,11 @@ type reachResultMsg struct {
 	reach scan.Reach
 	gen   int
 }
+type certResultMsg struct {
+	cert scan.CertResult
+	ok   bool
+	gen  int
+}
 
 // --- model ---
 
@@ -114,10 +119,12 @@ type model struct {
 
 	recordCh <-chan scan.RecordSet
 	foundCh  <-chan scan.Subdomain
+	certCh   <-chan scan.CertResult
 	progCh   <-chan int
 
 	recordsDone bool
 	subsDone    bool
+	certsDone   bool
 	progDone    int
 	progTotal   int
 
@@ -125,8 +132,8 @@ type model struct {
 	reach        map[string]scan.Reach // results keyed by host
 	reachPending int                   // probes still in flight
 
-	certEnabled bool           // harvest TLS certs and mine SANs (default on)
-	apexCert    *scan.CertInfo // the apex domain's own TLS certificate
+	certEnabled bool                      // harvest TLS certs and mine SANs (default on)
+	certs       map[string]*scan.CertInfo // harvested certificates keyed by host
 
 	saveMsg string // footer feedback after an export (path saved or error)
 
@@ -178,10 +185,11 @@ func (m model) startScan() (model, tea.Cmd) {
 	m.subs = nil
 	m.recordsDone = false
 	m.subsDone = false
+	m.certsDone = false
 	m.progDone = 0
 	m.reach = map[string]scan.Reach{}
 	m.reachPending = 0
-	m.apexCert = nil
+	m.certs = map[string]*scan.CertInfo{}
 	m.saveMsg = ""
 
 	// Drain any channels left over from a superseded scan so its worker
@@ -193,17 +201,21 @@ func (m model) startScan() (model, tea.Cmd) {
 	if m.foundCh != nil {
 		cmds = append(cmds, drain(m.foundCh))
 	}
+	if m.certCh != nil {
+		cmds = append(cmds, drain(m.certCh))
+	}
 	if m.progCh != nil {
 		cmds = append(cmds, drain(m.progCh))
 	}
 
 	m.recordCh = m.resolver.AllRecords(m.domain)
-	m.foundCh, m.progCh = m.resolver.EnumerateSubdomains(m.domain, m.certEnabled)
+	m.foundCh, m.certCh, m.progCh = m.resolver.EnumerateSubdomains(m.domain, m.certEnabled)
 
 	cmds = append(cmds,
 		m.spinner.Tick,
 		waitRecord(m.recordCh, m.gen),
 		waitFound(m.foundCh, m.gen),
+		waitCert(m.certCh, m.gen),
 		waitProg(m.progCh, m.gen),
 	)
 	if m.reachEnabled {
@@ -308,21 +320,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break // stale result from a superseded scan
 		}
 		if msg.ok {
-			if msg.sub.Name == m.domain {
-				// The apex emitted for its certificate; reachability for the
-				// apex is already probed in startScan.
-				m.apexCert = msg.sub.Cert
-			} else {
-				m.subs = append(m.subs, msg.sub)
-				if m.reachEnabled {
-					m.reachPending++
-					cmds = append(cmds, probeReach(msg.sub.Name, m.gen))
-				}
+			m.subs = append(m.subs, msg.sub)
+			if m.reachEnabled {
+				m.reachPending++
+				cmds = append(cmds, probeReach(msg.sub.Name, m.gen))
 			}
 			m.refreshViewport()
 			cmds = append(cmds, waitFound(m.foundCh, m.gen))
 		} else {
 			m.subsDone = true
+		}
+
+	case certResultMsg:
+		if msg.gen != m.gen {
+			break // stale result from a superseded scan
+		}
+		if msg.ok {
+			m.certs[msg.cert.Host] = msg.cert.Info
+			m.refreshViewport()
+			cmds = append(cmds, waitCert(m.certCh, m.gen))
+		} else {
+			m.certsDone = true
 		}
 
 	case reachResultMsg:
@@ -379,7 +397,7 @@ func (m *model) refreshViewport() {
 }
 
 func (m model) scanning() bool {
-	return !m.recordsDone || !m.subsDone || m.reachPending > 0
+	return !m.recordsDone || !m.subsDone || !m.certsDone || m.reachPending > 0
 }
 
 // reachTotal is the number of hosts probed for reachability: every found
@@ -387,18 +405,7 @@ func (m model) scanning() bool {
 func (m model) reachTotal() int { return len(m.subs) + 1 }
 
 // certCount reports how many harvested certificates we hold (apex + subs).
-func (m model) certCount() int {
-	n := 0
-	if m.apexCert != nil {
-		n++
-	}
-	for _, s := range m.subs {
-		if s.Cert != nil {
-			n++
-		}
-	}
-	return n
-}
+func (m model) certCount() int { return len(m.certs) }
 
 // reachableCount reports how many probed hosts answered an HTTP request.
 func (m model) reachableCount() int {
@@ -537,7 +544,7 @@ func (m model) renderResults() string {
 
 	// Subdomains: nested by label depth below the apex.
 	subs := &treeNode{text: branchStyle.Render(fmt.Sprintf("subdomains (%d)", len(m.subs)))}
-	subs.children = buildSubTree(m.domain, m.subs, m.reach, m.reachEnabled)
+	subs.children = buildSubTree(m.domain, m.subs, m.certs, m.reach, m.reachEnabled)
 	if len(subs.children) == 0 {
 		msg := "probing..."
 		if m.subsDone {
@@ -547,8 +554,8 @@ func (m model) renderResults() string {
 	}
 
 	root.children = []*treeNode{records, subs}
-	if m.apexCert != nil {
-		root.children = append([]*treeNode{{text: renderCert(m.apexCert)}}, root.children...)
+	if apex := m.certs[m.domain]; apex != nil {
+		root.children = append([]*treeNode{{text: renderCert(apex)}}, root.children...)
 	}
 
 	var b strings.Builder
@@ -562,7 +569,6 @@ type subNode struct {
 	label    string
 	name     string // full host, set only on nodes that are a discovered subdomain
 	ips      []string
-	cert     *scan.CertInfo
 	children map[string]*subNode
 }
 
@@ -570,7 +576,7 @@ type subNode struct {
 // relative to the apex domain (e.g. api.staging nests api under staging).
 // When reachOn is set, each discovered host is annotated with its HTTP(S)
 // reachability from reach (or a pending marker until its probe returns).
-func buildSubTree(domain string, found []scan.Subdomain, reach map[string]scan.Reach, reachOn bool) []*treeNode {
+func buildSubTree(domain string, found []scan.Subdomain, certs map[string]*scan.CertInfo, reach map[string]scan.Reach, reachOn bool) []*treeNode {
 	root := &subNode{children: map[string]*subNode{}}
 	suffix := "." + domain
 	for _, s := range found {
@@ -588,12 +594,11 @@ func buildSubTree(domain string, found []scan.Subdomain, reach map[string]scan.R
 		}
 		cur.ips = s.IPs
 		cur.name = s.Name
-		cur.cert = s.Cert
 	}
-	return root.toTreeNodes(reach, reachOn)
+	return root.toTreeNodes(certs, reach, reachOn)
 }
 
-func (n *subNode) toTreeNodes(reach map[string]scan.Reach, reachOn bool) []*treeNode {
+func (n *subNode) toTreeNodes(certs map[string]*scan.CertInfo, reach map[string]scan.Reach, reachOn bool) []*treeNode {
 	keys := make([]string, 0, len(n.children))
 	for k := range n.children {
 		keys = append(keys, k)
@@ -604,7 +609,7 @@ func (n *subNode) toTreeNodes(reach map[string]scan.Reach, reachOn bool) []*tree
 	for _, k := range keys {
 		c := n.children[k]
 		text := hostStyle.Render(c.label)
-		if c.cert != nil {
+		if c.name != "" && certs[c.name] != nil {
 			text += " " + labelStyle.Render(certIcon)
 		}
 		if reachOn && c.name != "" {
@@ -616,7 +621,7 @@ func (n *subNode) toTreeNodes(reach map[string]scan.Reach, reachOn bool) []*tree
 		if reachOn && c.name != "" {
 			text += "  " + renderReach(reach, c.name)
 		}
-		node := &treeNode{text: text, children: c.toTreeNodes(reach, reachOn)}
+		node := &treeNode{text: text, children: c.toTreeNodes(certs, reach, reachOn)}
 		out = append(out, node)
 	}
 	return out
@@ -723,6 +728,13 @@ func waitFound(ch <-chan scan.Subdomain, gen int) tea.Cmd {
 	return func() tea.Msg {
 		sub, ok := <-ch
 		return subFoundMsg{sub: sub, ok: ok, gen: gen}
+	}
+}
+
+func waitCert(ch <-chan scan.CertResult, gen int) tea.Cmd {
+	return func() tea.Msg {
+		cert, ok := <-ch
+		return certResultMsg{cert: cert, ok: ok, gen: gen}
 	}
 }
 

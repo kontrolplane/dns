@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/levi/dns/scan"
@@ -48,7 +49,7 @@ func (m model) save() (string, error) {
 		Domain:     m.domain,
 		Nameserver: m.resolver.Server(),
 		ScannedAt:  now.Format(time.RFC3339),
-		ApexCert:   m.apexCert,
+		ApexCert:   m.certs[m.domain],
 	}
 
 	// Records arrive concurrently; emit them in the canonical order so two
@@ -65,8 +66,11 @@ func (m model) save() (string, error) {
 		snap.Records = append(snap.Records, re)
 	}
 
-	for _, s := range m.subs {
-		se := subExport{Name: s.Name, IPs: s.IPs, Cert: s.Cert}
+	subs := append([]scan.Subdomain(nil), m.subs...)
+	sort.Slice(subs, func(i, j int) bool { return subs[i].Name < subs[j].Name })
+
+	for _, s := range subs {
+		se := subExport{Name: s.Name, IPs: s.IPs, Cert: m.certs[s.Name]}
 		if m.reachEnabled {
 			if r, ok := m.reach[s.Name]; ok && r.Reachable() {
 				se.Reach = &reachExport{Scheme: r.Scheme, Status: r.Status}

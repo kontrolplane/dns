@@ -34,21 +34,30 @@ func TestSubdomainSmoke(t *testing.T) {
 		t.Skip("network test")
 	}
 	r := NewResolver("")
-	found, prog := r.EnumerateSubdomains("github.com", true)
-	done := make(chan struct{})
+	found, certs, prog := r.EnumerateSubdomains("github.com", true)
+	done := make(chan struct{}, 2)
 	go func() {
 		for range prog {
 		}
-		close(done)
+		done <- struct{}{}
+	}()
+	var harvested int
+	go func() {
+		for range certs {
+			harvested++
+		}
+		done <- struct{}{}
 	}()
 	var subs []Subdomain
 	for s := range found {
 		subs = append(subs, s)
 	}
 	<-done
+	<-done
 	if len(subs) == 0 {
 		t.Error("expected to discover subdomains for github.com, found none")
 	}
+	t.Logf("found %d subdomains, %d certificates", len(subs), harvested)
 }
 
 // TestTruncatedAnswerSmoke guards the EDNS0 + TCP fallback path: these
